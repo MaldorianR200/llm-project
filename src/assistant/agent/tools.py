@@ -12,7 +12,7 @@ WAREHOUSES = ["Москва", "Санкт-Петербург", "Казань", "
 PART_ID_PATTERN = r"^P-[0-9]{4}[A-Z]?$"
 PART_ID = {"type": "string", "pattern": PART_ID_PATTERN, "description": "Номер детали, например P-1042B"}
 WAREHOUSE = {"type": "string", "enum": WAREHOUSES}
-QUESTION = {"type": "string", " description": "Вопрос для поиска по базе знаний"}
+QUESTION = {"type": "string", "description": "Вопрос для поиска по базе знаний"}
 
 
 def _tool_schema(name: str, description: str, properties: dict) -> dict:

@@ -4,7 +4,7 @@ from collections import Counter
 
 import networkx as nx
 
-from assistant.infra.llm import LLMClient
+from assistant.infra.llm import SEED, LLMClient
 from assistant.infra.schemas import Community
 
 
@@ -13,14 +13,22 @@ def detect_communities(graph: nx.DiGraph) -> list[Community]:
 
     Каждый узел входит ровно в одно сообщество. Поле `summary` здесь остаётся пустым.
     """
-    # TODO: снять направление рёбер, разбить с учётом weight, вернуть Community с номерами по порядку
     undirected = nx.Graph()
     undirected.add_nodes_from(sorted(graph))
-    for source, target, attrs in sorted(graph.edges(data=True)):
-        previous = undirected.get_edge_data(source, target, default={})
-        undirected.add_edge(source, target, weight=previous.get("weight", 0) + attrs.get("weight", 1))
-    groups = nx.community.louvain_communities(undirected, weight="weight", seed=7) if undirected else []
-    return [Community(index, nodes) for index, nodes in enumerate(sorted(map(sorted, groups)))]
+
+    for subject_id, object_id, data in sorted(graph.edges(data=True)):
+        weight = data.get("weight", 1)
+        if undirected.has_edge(subject_id, object_id):
+            undirected.edges[subject_id, object_id]["weight"] += weight
+        else:
+            undirected.add_edge(subject_id, object_id, weight=weight)
+
+    if not undirected:
+        return []
+
+    partition = nx.community.louvain_communities(undirected, weight="weight", seed=SEED)
+    ordered_groups = sorted((sorted(nodes) for nodes in partition), key=lambda nodes: nodes[0])
+    return [Community(community_id, nodes) for community_id, nodes in enumerate(ordered_groups)]
 
 
 def summarize_community(community: Community, graph: nx.DiGraph, llm: LLMClient) -> str:
@@ -28,40 +36,84 @@ def summarize_community(community: Community, graph: nx.DiGraph, llm: LLMClient)
 
     Все числа считает код по весам рёбер и передаёт модели готовыми. Модель их только формулирует.
     """
-    # TODO: собрать факты и подсчёты сообщества, попросить модель написать сводку
-    members = set(community.nodes)
+    nodes = [node_id for node_id in community.nodes if node_id in graph]
+    node_set = set(nodes)
     names = nx.get_node_attributes(graph, "name")
-    failures: Counter[tuple[str, str]] = Counter()
-    facts = []
-    for source, target, attrs in sorted(graph.edges(data=True)):
-        kind = attrs["type"]
-        weight = attrs["weight"]
-        if kind == "FAILED" and target in members:
-            # Каждый узел оборудования относится к одному сообществу, поэтому отказы не дублируются
-            lines = [
-                names[node] for node, edge in graph[source].items() if edge["type"] == "BELONGS_TO"
-            ]
-            for line in lines or ["линейка неизвестна"]:
-                failures[line, names[target]] += weight
-            facts.append(f"{names[source]} -FAILED-> {names[target]}: {weight}")
-        # Для остальных связей оба узла должны входить в сообщество
-        elif kind != "FAILED" and source in members and target in members:
-            facts.append(f"{names[source]} -{kind}-> {names[target]}")
+    entity_counts = Counter(graph.nodes[node_id].get("type", "Unknown") for node_id in nodes)
+    relation_counts: Counter[str] = Counter()
+    failure_counts: Counter[tuple[str, str]] = Counter()
+    facts: list[str] = []
 
-    counts = "\n".join(f"{line}, {component}: {count}" for (line, component), count in sorted(failures.items()))
-    context = "\n".join(facts)
-    members_text = ", ".join(names[node] for node in community.nodes)
-    reply = llm.chat([
+    for subject_id, object_id, data in sorted(graph.edges(data=True)):
+        relation_type = data.get("type", "UNKNOWN")
+        weight = int(data.get("weight", 1))
+        subject_name = names.get(subject_id, subject_id)
+        object_name = names.get(object_id, object_id)
+
+        if relation_type == "FAILED" and object_id in node_set:
+            # Привязываем отказ к линейке модели кодом, чтобы LLM не смешивала линейки при сравнении.
+            product_lines = [
+                names.get(target_id, target_id)
+                for target_id, edge in graph[subject_id].items()
+                if edge.get("type") == "BELONGS_TO"
+            ]
+            for product_line in product_lines or ["линейка неизвестна"]:
+                failure_counts[product_line, object_name] += weight
+            relation_counts[relation_type] += weight
+            facts.append(f"{subject_name} -FAILED-> {object_name} (вес: {weight})")
+        elif relation_type != "FAILED" and subject_id in node_set and object_id in node_set:
+            relation_counts[relation_type] += weight
+            facts.append(f"{subject_name} -{relation_type}-> {object_name} (вес: {weight})")
+
+    entity_stats = _format_counts(entity_counts)
+    relation_stats = _format_counts(relation_counts)
+    failure_stats = _format_failures(failure_counts)
+    member_names = ", ".join(names.get(node_id, node_id) for node_id in nodes) or "нет"
+    fact_list = "\n".join(f"{number}. {fact}" for number, fact in enumerate(facts, start=1))
+    if not fact_list:
+        fact_list = "Внутренних связей нет."
+
+    messages = [
         {
             "role": "system",
             "content": (
-                "Составь сводку сообщества до 150 слов. Укажи основные сущности и связи. "
-                "Если даны итоги по отказам, сохрани линейки, названия узлов и числа без изменений."
+                "Ты составляешь краткие сводки сообществ графа знаний сервисной службы. "
+                "Используй только переданные факты и уже рассчитанные числа. Не пересчитывай и не придумывай числа. "
+                "Сохраняй названия линеек и не смешивай показатели разных линеек. "
+                "Ответь по-русски, не более чем 150 словами."
             ),
         },
         {
             "role": "user",
-            "content": f"Итоги по отказам:\n{counts}\nУзлы: {members_text}\nФакты:\n{context}",
+            "content": (
+                f"Сообщество {community.community_id}.\n"
+                f"Узлов: {len(nodes)}.\n"
+                f"Узлы: {member_names}.\n"
+                f"Сущности по типам: {entity_stats}.\n"
+                f"Суммарный вес связей по типам: {relation_stats}.\n"
+                f"Итоги по отказам для каждой линейки и узла: {failure_stats}.\n"
+                "Опиши, какие сущности входят в сообщество, как они связаны и что встречается чаще всего.\n"
+                f"Факты:\n{fact_list}"
+            ),
         },
-    ])
-    return " ".join(reply.content.split()[:150])
+    ]
+    response = llm.chat(messages, max_tokens=300).content
+    words = response.split()
+    return " ".join(words[:150]) if words else "Сводка не сформирована."
+
+
+def _format_counts(counts: Counter[str]) -> str:
+    """Форматирует рассчитанные кодом показатели в стабильном порядке."""
+    if not counts:
+        return "нет"
+    return ", ".join(f"{name}: {count}" for name, count in sorted(counts.items()))
+
+
+def _format_failures(counts: Counter[tuple[str, str]]) -> str:
+    """Форматирует взвешенные частоты отказов отдельно по линейкам."""
+    if not counts:
+        return "нет"
+    return ", ".join(
+        f"{product_line} — {component}: {count}"
+        for (product_line, component), count in sorted(counts.items())
+    )
