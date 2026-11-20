@@ -5,7 +5,7 @@ import re
 from pydantic import BaseModel, ValidationError
 
 from assistant.infra.config import vocabulary
-from assistant.infra.grounding import CODE_TYPES, canonical_name, find_codes, find_names
+from assistant.infra.grounding import CODE_TYPES, canonical_name, code_type, find_codes, find_names
 from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import EXTRACTION_SCHEMA, Chunk, Entity, ExtractionResult, Relation
 
@@ -42,6 +42,25 @@ SYSTEM = """Извлеки сущности и связи из фрагмент�
               {"subject_type":"Part","subject":"P-1042","type":"SUPPLIED_BY",
                "object_type":"Supplier","object":"ХолодКомплект"}]}
 """
+
+_MANUAL_SECTION = re.compile(r"^## Состав узлов\s*\n(.*?)(?=^## |\Z)", re.MULTILINE | re.DOTALL)
+_PART_CODE = r"P-[0-9]{4}[A-Z]?"
+_PART_ROW = re.compile(rf"^- .+? [–—-] деталь ({_PART_CODE})(?=,|$)", re.MULTILINE)
+_REPLACEMENT = re.compile(
+    rf"\bДеталь ({_PART_CODE})(?: \([^\n)]+\))? снята с производства\.\s+"
+    rf"Вместо не[её] устанавливается деталь ({_PART_CODE})\."
+)
+_PROCEDURE_APPLICATION = re.compile(r"^Регламент (SP-[0-9]{3}) применяется при ошибке (E-[0-9]{2})\.", re.MULTILINE)
+
+
+def _manual_parts(text: str) -> list[Relation]:
+    title = text.partition("\n")[0]
+    models = [code for code in find_codes(title) if code_type(code) == "Model"]
+    section = _MANUAL_SECTION.search(text)
+    if not title.startswith("# Руководство ") or len(models) != 1 or section is None:
+        return []
+    model = Entity("Model", models[0])
+    return [Relation(model, "HAS_PART", Entity("Part", part_id)) for part_id in _PART_ROW.findall(section[1])]
 
 
 class _EntityFields(BaseModel):
@@ -124,6 +143,7 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
         else:
             entities[Entity(item.type, name)] = None
 
+    replacements = set(_REPLACEMENT.findall(chunk.text))
     relations: dict[Relation, None] = {}
     for item in extracted.relations:
         subject = _canonical_extracted_name(item.subject_type, item.subject, names)
@@ -141,8 +161,20 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
         ):
             result.dropped += 1
             continue
+        if relation.type == "REPLACED_BY" and (target, subject) in replacements:
+            relation = Relation(end, relation.type, start)
         entities[start] = None
         entities[end] = None
+        relations[relation] = None
+
+    explicit_relations = _manual_parts(chunk.text)
+    explicit_relations.extend(
+        Relation(Entity("ErrorCode", error), "FIXED_BY", Entity("Procedure", procedure))
+        for procedure, error in _PROCEDURE_APPLICATION.findall(chunk.text)
+    )
+    for relation in explicit_relations:
+        entities[relation.subject] = None
+        entities[relation.object] = None
         relations[relation] = None
 
     result.entities = list(entities)

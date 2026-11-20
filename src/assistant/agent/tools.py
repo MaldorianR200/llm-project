@@ -52,15 +52,22 @@ TOOL_SCHEMAS: list[dict] = [
 ]
 
 
-def _call_erp(method: Callable[..., dict], part_id: str, **arguments) -> dict:
+def validate_erp_arguments(part_id: str, **arguments) -> str | None:
     if not isinstance(part_id, str) or not re.fullmatch(PART_ID_PATTERN, part_id):
-        return {"error": "Укажи номер детали в формате P-1042 или P-1042B."}
+        return "Укажи номер детали в формате P-1042 или P-1042B."
     if "warehouse" in arguments and arguments["warehouse"] not in WAREHOUSES:
-        return {"error": f"Неизвестный склад. Допустимые склады: {', '.join(WAREHOUSES)}."}
+        return f"Неизвестный склад. Допустимые склады: {', '.join(WAREHOUSES)}."
     if "qty" in arguments and (type(arguments["qty"]) is not int or arguments["qty"] <= 0):
-        return {"error": "Количество должно быть положительным целым числом."}
+        return "Количество должно быть положительным целым числом."
     if "model" in arguments and (not isinstance(arguments["model"], str) or not arguments["model"].strip()):
-        return {"error": "Укажи модель оборудования."}
+        return "Укажи модель оборудования."
+    return None
+
+
+def _call_erp(method: Callable[..., dict], part_id: str, **arguments) -> dict:
+    error = validate_erp_arguments(part_id, **arguments)
+    if error:
+        return {"error": error}
 
     try:
         return method(part_id=part_id, **arguments)
