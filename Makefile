@@ -6,18 +6,10 @@ MODE ?= agent
 ARGS ?=
 Q ?= Ошибка E-17 на AR-210. Какую деталь заказать, есть ли она на складе в Казани и сколько она стоит?
 
-ifeq ($(shell uname -s),Darwin)
-PDF_FONT ?= Arial
-PDF_MONO_FONT ?= Menlo
-else
-PDF_FONT ?= DejaVu Sans
-PDF_MONO_FONT ?= DejaVu Sans Mono
-endif
-
 include .env
 export
 
-.PHONY: up up-llm pull-models index ask eval eval-all eval-extraction test lint down pdf
+.PHONY: up up-llm pull-models index ask eval eval-all eval-extraction test lint down
 
 .env:
 	cp .env.example .env
@@ -55,10 +47,3 @@ lint: ## линтер
 
 down: ## остановить сервисы
 	docker compose --profile local-llm down
-
-pdf: ## собрать REPORT.pdf из REPORT.md
-	pandoc REPORT.md --from=markdown --columns=80 --pdf-engine=xelatex \
-		-M lang=ru -M title-meta="Ассистент сервисной службы «ПолярТех»" \
-		-V papersize=a4 -V geometry:margin=20mm -V fontsize=10pt \
-		-V mainfont="$(PDF_FONT)" -V monofont="$(PDF_MONO_FONT)" \
-		-V colorlinks -o REPORT.pdf
